@@ -1,0 +1,9 @@
+[package]
+authors = ["rachelmcguire"]
+name = "waiter"
+version = "0.1.0"
+
+[dependencies]
+clap = "2.23"
+local-ip = "0.1.0"
+rouille = "1.0"
