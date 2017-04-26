@@ -2,15 +2,24 @@ extern crate rouille;
 extern crate clap;
 extern crate local_ip;
 
-use rouille::{Request, Response};
+use rouille::{Request, Response, Server};
 use clap::{Arg, App};
 
 use std::net::IpAddr;
+use std::sync::{Mutex, Arc};
 use std::fs::File;
 use std::path::Path;
 use std::string::ToString;
+use std::process::exit;
 
 const DEFAULT_PORT: u16 = 8000;
+
+// Operation modes: file, navigate folder
+
+enum Count {
+    Infinite,
+    Limited(usize),
+}
 
 fn main() {
     let matches = App::new("Waiter")
@@ -29,9 +38,12 @@ fn main() {
                  .value_name("PORT")
                  .help("Sets TCP port for server (default 8000)")
                  .takes_value(true))
-        .arg(Arg::with_name("single")
-                 .long("--single")
-                 .help("Server will exit after first succesfull request"))
+        .arg(Arg::with_name("count")
+                 .short("c")
+                 .long("--count")
+                 .value_name("CAOUNT")
+                 .help("Server will exit after COUNT succesful requests")
+                 .takes_value(true))
         .arg(Arg::with_name("file")
                  .help("File or folder to be served")
                  .required(true)
@@ -55,25 +67,55 @@ fn main() {
     let pathstr = matches.value_of("file").unwrap(); // unwrapping because "file" is a required parameter
     let path = Path::new(pathstr).to_owned();
 
-    println!("🍔  Now serving {} on http://{}:{}.", pathstr, addr, port);
+    let count = matches
+        .value_of("count")
+        .map(|v| {
+                 Count::Limited(v.parse::<usize>()
+                                    .expect("Invalid count value. Must be integer > 0."))
+             })
+        .unwrap_or(Count::Infinite);
 
-    rouille::start_server((addr.as_ref(), port), move |req| {
+    let count_mutex = Mutex::new(count);
+
+    let server = Server::new((addr.as_ref(), port), move |req| {
         let url = req.url();
-        println!("💁  Received {} request for URL {} from {}", req.method(), url, req.remote_addr());
+        println!("💁  Received {} request for URL {} from {}",
+                 req.method(),
+                 url,
+                 req.remote_addr());
         if url == "/" {
-            println!("👍  Serving {}...", path.to_string_lossy());
+            if let Count::Limited(ref mut count) = *count_mutex.lock().unwrap() {
+                if *count > 0 {
+                    println!("👍  Serving {}...", path.to_string_lossy());
+                    *count -= 1;
 
-            let file = File::open(&path).expect("Failed to open the given path");
+                    let file = File::open(&path).expect("Failed to open the given path");
 
-            Response::from_file("application/octet-stream", file)
-                .with_unique_header("content-disposition",
-                                    format!("attachment; filename={}",
-                                            path.file_name().unwrap().to_string_lossy()))
+                    Response::from_file("application/octet-stream", file)
+                        .with_unique_header("content-disposition",
+                                            format!("attachment; filename={}",
+                                                    path.file_name().unwrap().to_string_lossy()))
+                } else {
+                    Response::text("Sorry boss, you are late to the party.\r\n")
+                }
+            } else {
+                let file = File::open(&path).expect("Failed to open the given path");
+
+                Response::from_file("application/octet-stream", file)
+                    .with_unique_header("content-disposition",
+                                        format!("attachment; filename={}",
+                                                path.file_name().unwrap().to_string_lossy()))
+            }
+
         } else {
             println!("👮  Responding with 404.");
 
             Response::empty_404()
         }
 
-    });
+    })
+            .unwrap();
+
+    println!("🍔  Now serving {} on http://{}:{}.", pathstr, addr, port);
+    server.run();
 }
