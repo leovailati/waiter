@@ -1,27 +1,36 @@
-extern crate rouille;
-extern crate clap;
-extern crate local_ip;
 
-use rouille::{Request, Response, Server};
+// TODO: add to tiny branch
+//#![feature(alloc_system)]
+//extern crate alloc_system;
+
+//extern crate rouille;
+extern crate hyper;
+extern crate clap;
+
+//use rouille::{Request, Response, Server};
+use hyper::server::{Server, Request, Response};
 use clap::{Arg, App};
 
-use std::net::IpAddr;
+use std::net::{IpAddr, ToSocketAddrs};
 use std::sync::{Mutex, Arc};
 use std::fs::File;
 use std::path::Path;
 use std::string::ToString;
-use std::process::exit;
+use std::process;
+use std::error::Error;
+
+mod local_ip;
 
 const DEFAULT_PORT: u16 = 8000;
 
-// Operation modes: file, navigate folder
 
-enum Count {
-    Infinite,
-    Limited(usize),
+fn file_handler(req: Request, res: Response) {
+    
 }
 
 fn main() {
+    let port_str = &DEFAULT_PORT.to_string();
+
     let matches = App::new("Waiter")
         .version("0.1")
         .author("Leo Vailati <leovailati@gmail.com>")
@@ -30,53 +39,58 @@ fn main() {
                  .short("a")
                  .long("address")
                  .value_name("ADDRESS")
-                 .help("Sets address for server")
+                 .help("Sets address for server. If not provided, waiter will try to figure out by itself what the local address sould be.")
                  .takes_value(true))
         .arg(Arg::with_name("port")
                  .short("p")
                  .long("--port")
                  .value_name("PORT")
-                 .help("Sets TCP port for server (default 8000)")
+                 .help("Sets TCP port for server.")
+                 .default_value(port_str)
                  .takes_value(true))
         .arg(Arg::with_name("count")
                  .short("c")
                  .long("--count")
-                 .value_name("CAOUNT")
-                 .help("Server will exit after COUNT succesful requests")
+                 .value_name("COUNT")
+                 .help("Server will exit after <COUNT> succesful requests.")
                  .takes_value(true))
         .arg(Arg::with_name("file")
-                 .help("File or folder to be served")
+                 .help("File to be served")
                  .required(true)
                  .index(1))
         .get_matches();
 
-    let addr = matches
-        .value_of("address")
-        .map(String::from)
-        .unwrap_or_else(|| {
-                            local_ip::get()
-                                .expect("Unable to automatically determine local IP address.")
-                                .to_string()
-                        });
-
-    let port = matches
-        .value_of("port")
-        .map(|v| v.parse::<u16>().expect("Invalid port number."))
-        .unwrap_or(DEFAULT_PORT);
-
     let pathstr = matches.value_of("file").unwrap(); // unwrapping because "file" is a required parameter
     let path = Path::new(pathstr).to_owned();
 
-    let count = matches
-        .value_of("count")
-        .map(|v| {
-                 Count::Limited(v.parse::<usize>()
-                                    .expect("Invalid count value. Must be integer > 0."))
-             })
-        .unwrap_or(Count::Infinite);
+    //let count_mutex = Mutex::new(count);
 
-    let count_mutex = Mutex::new(count);
+    let port = match matches.value_of("port") {
+        None => DEFAULT_PORT,
+        Some(s) => num_arg_validator::<u16>(s),
+    };
 
+    let count = match matches.value_of("count") {
+        None => None,
+        Some(s) => Some(num_arg_validator::<usize>(s)),
+    };
+
+    let server = match matches.value_of("address") {
+        Some(val) => Server::http((val, port)),
+        None => {
+            let ip =
+                local_ip::local_ip().expect("Unable to automatically determine local IP address.");
+            Server::http((ip, port))
+        }
+    };
+
+    server.
+
+    //println!("🍔  Now serving {} on http://{}.",
+    //         pathstr,
+    //         server.local_addr().unwrap());
+
+    /*
     let server = Server::new((addr.as_ref(), port), move |req| {
         let url = req.url();
         println!("💁  Received {} request for URL {} from {}",
@@ -116,6 +130,30 @@ fn main() {
     })
             .unwrap();
 
-    println!("🍔  Now serving {} on http://{}:{}.", pathstr, addr, port);
-    server.run();
+
+    server.run();*/
+
+    println!("{:?}", local_ip::local_ip());
+}
+
+use std::str::FromStr;
+use std::num::ParseIntError;
+
+fn num_arg_validator<N: FromStr<Err = ParseIntError>>(num_str: &str) -> N {
+    match num_str.parse::<N>() {
+        Ok(x) => x,
+
+        Err(e) => {
+            let desc = e.description().to_owned();
+            let err = clap::Error::value_validation_auto(desc);
+            graciously_exit(&err)
+        }
+    }
+}
+
+use std::fmt::Display;
+
+fn graciously_exit<T: Display>(msg: &T) -> ! {
+    println!("{}", msg);
+    process::exit(0)
 }
