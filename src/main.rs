@@ -1,31 +1,90 @@
 
 // TODO: add to tiny branch
-//#![feature(alloc_system)]
-//extern crate alloc_system;
+#![feature(alloc_system)]
+extern crate alloc_system;
 
 //extern crate rouille;
 extern crate hyper;
 extern crate clap;
 
-//use rouille::{Request, Response, Server};
-use hyper::server::{Server, Request, Response};
+use hyper::server::{Server, Request, Response, Handler};
 use clap::{Arg, App};
 
-use std::net::{IpAddr, ToSocketAddrs};
 use std::sync::{Mutex, Arc};
 use std::fs::File;
 use std::path::Path;
 use std::string::ToString;
 use std::process;
 use std::error::Error;
+use std::io::Read;
+use std::io::Write;
 
 mod local_ip;
 
 const DEFAULT_PORT: u16 = 8000;
 
+struct FileServer {
+    count: Mutex<Option<usize>>,
+    file_data: Arc<Vec<u8>>,
+    file_name: String,
+}
 
-fn file_handler(req: Request, res: Response) {
-    
+use hyper::header::Headers;
+
+fn set_headers_for_file(headers: &mut Headers, file_name: &str) {
+    use hyper::header::{ContentDisposition, DispositionType, DispositionParam, Charset,
+                        ContentType};
+    use hyper::mime::{Mime, TopLevel, SubLevel};
+
+    let content_disposition = ContentDisposition {
+        disposition: DispositionType::Attachment,
+        parameters: vec![DispositionParam::Filename(Charset::Iso_8859_1,
+                                                    None,
+                                                    file_name.to_owned().into_bytes())],
+    };
+
+    let content_type = ContentType(Mime(TopLevel::Application, SubLevel::OctetStream, vec![]));
+
+    headers.set(content_type);
+    headers.set(content_disposition);
+}
+
+impl Handler for FileServer {
+    fn handle(&self, req: Request, mut res: Response) {
+        use hyper::uri::RequestUri;
+        use hyper::status::StatusCode;
+
+        println!("💁  Received {} request for URL {} from {}",
+                 req.method,
+                 req.uri,
+                 req.remote_addr);
+
+        if req.uri == RequestUri::AbsolutePath("/".to_owned()) {
+            set_headers_for_file(res.headers_mut(), &self.file_name);
+
+            let mut res = res.start().unwrap_or_else(|e| graciously_exit(&e));
+
+            res.write_all(self.file_data.as_slice());
+            res.end();
+
+            if let Some(ref mut c) = *self.count.lock().unwrap() {
+                if *c > 0 {
+                    *c -= 1;
+                    println!("⬇️  Servings left: {}", *c);
+                }
+
+                if *c == 0 {
+                    graciously_exit("Mission accomplished");
+                }
+            };
+
+        } else {
+            println!("👮  Responding with 404.");
+
+            let mut status = res.status_mut();
+            *status = StatusCode::NotFound;
+        }
+    }
 }
 
 fn main() {
@@ -60,10 +119,19 @@ fn main() {
                  .index(1))
         .get_matches();
 
-    let pathstr = matches.value_of("file").unwrap(); // unwrapping because "file" is a required parameter
-    let path = Path::new(pathstr).to_owned();
+    let path_str = matches.value_of("file").unwrap(); // unwrapping because "file" is a required parameter
+    let path = Path::new(path_str);
+    let mut file = File::open(path).unwrap_or_else(|e| graciously_exit(&e));
 
-    //let count_mutex = Mutex::new(count);
+    let file_name = path.file_name()
+        .unwrap_or_else(|| graciously_exit("Invalid file name."))
+        .to_str()
+        .unwrap_or_else(|| graciously_exit("Invalid file name."))
+        .to_owned();
+
+    let mut file_data = Vec::new();
+    file.read_to_end(&mut file_data)
+        .unwrap_or_else(|e| graciously_exit(&e));
 
     let port = match matches.value_of("port") {
         None => DEFAULT_PORT,
@@ -84,19 +152,28 @@ fn main() {
         }
     };
 
-    server.
+    let mut server = server.unwrap_or_else(|e| graciously_exit(&e));
+    let local_addr = server
+        .local_addr()
+        .unwrap_or_else(|e| graciously_exit(&e));
 
-    //println!("🍔  Now serving {} on http://{}.",
-    //         pathstr,
-    //         server.local_addr().unwrap());
+    let file_server = FileServer {
+        count: Mutex::new(count),
+        file_data: Arc::new(file_data),
+        file_name: file_name,
+    };
+
+    match server.handle(file_server) {
+        Ok(_) => {
+            println!("🍔  Now serving {} on http://{}", path_str, local_addr);
+        }
+        Err(e) => graciously_exit(&e),
+    };
 
     /*
     let server = Server::new((addr.as_ref(), port), move |req| {
         let url = req.url();
-        println!("💁  Received {} request for URL {} from {}",
-                 req.method(),
-                 url,
-                 req.remote_addr());
+
         if url == "/" {
             if let Count::Limited(ref mut count) = *count_mutex.lock().unwrap() {
                 if *count > 0 {
@@ -122,7 +199,7 @@ fn main() {
             }
 
         } else {
-            println!("👮  Responding with 404.");
+
 
             Response::empty_404()
         }
@@ -153,7 +230,7 @@ fn num_arg_validator<N: FromStr<Err = ParseIntError>>(num_str: &str) -> N {
 
 use std::fmt::Display;
 
-fn graciously_exit<T: Display>(msg: &T) -> ! {
+fn graciously_exit<T: Display>(msg: T) -> ! {
     println!("{}", msg);
     process::exit(0)
 }
