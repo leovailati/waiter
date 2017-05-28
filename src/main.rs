@@ -1,90 +1,43 @@
 
 // TODO: add to tiny branch
-#![feature(alloc_system)]
-extern crate alloc_system;
+//#![feature(alloc_system)]
+//extern crate alloc_system;
 
-//extern crate rouille;
 extern crate hyper;
 extern crate clap;
+extern crate pretty_bytes;
 
-use hyper::server::{Server, Request, Response, Handler};
+use hyper::server::Server;
 use clap::{Arg, App};
 
-use std::sync::{Mutex, Arc};
+use std::sync::Arc;
 use std::fs::File;
 use std::path::Path;
-use std::string::ToString;
 use std::process;
 use std::error::Error;
 use std::io::Read;
-use std::io::Write;
+use std::ffi::OsStr;
 
 mod local_ip;
+mod dir_nav;
+mod http_serv;
+
+use http_serv::{SingleFile, FolderNav};
 
 const DEFAULT_PORT: u16 = 8000;
 
-struct FileServer {
-    count: Mutex<Option<usize>>,
-    file_data: Arc<Vec<u8>>,
-    file_name: String,
-}
+pub fn file_open(path: &Path) -> (Vec<u8>, String) {
+    let file_name = path.file_name()
+        .map(|s| safely_unwrap_os_str(s).to_owned())
+        .unwrap_or_else(|| graciously_exit("Invalid file name."));
 
-use hyper::header::Headers;
+    let mut file = File::open(path).unwrap_or_else(|e| graciously_exit(&e));
 
-fn set_headers_for_file(headers: &mut Headers, file_name: &str) {
-    use hyper::header::{ContentDisposition, DispositionType, DispositionParam, Charset,
-                        ContentType};
-    use hyper::mime::{Mime, TopLevel, SubLevel};
+    let mut file_data = Vec::new();
+    file.read_to_end(&mut file_data)
+        .unwrap_or_else(|e| graciously_exit(&e));
 
-    let content_disposition = ContentDisposition {
-        disposition: DispositionType::Attachment,
-        parameters: vec![DispositionParam::Filename(Charset::Iso_8859_1,
-                                                    None,
-                                                    file_name.to_owned().into_bytes())],
-    };
-
-    let content_type = ContentType(Mime(TopLevel::Application, SubLevel::OctetStream, vec![]));
-
-    headers.set(content_type);
-    headers.set(content_disposition);
-}
-
-impl Handler for FileServer {
-    fn handle(&self, req: Request, mut res: Response) {
-        use hyper::uri::RequestUri;
-        use hyper::status::StatusCode;
-
-        println!("💁  Received {} request for URL {} from {}",
-                 req.method,
-                 req.uri,
-                 req.remote_addr);
-
-        if req.uri == RequestUri::AbsolutePath("/".to_owned()) {
-            set_headers_for_file(res.headers_mut(), &self.file_name);
-
-            let mut res = res.start().unwrap_or_else(|e| graciously_exit(&e));
-
-            res.write_all(self.file_data.as_slice());
-            res.end();
-
-            if let Some(ref mut c) = *self.count.lock().unwrap() {
-                if *c > 0 {
-                    *c -= 1;
-                    println!("⬇️  Servings left: {}", *c);
-                }
-
-                if *c == 0 {
-                    graciously_exit("Mission accomplished");
-                }
-            };
-
-        } else {
-            println!("👮  Responding with 404.");
-
-            let mut status = res.status_mut();
-            *status = StatusCode::NotFound;
-        }
-    }
+    (file_data, file_name)
 }
 
 fn main() {
@@ -98,40 +51,30 @@ fn main() {
                  .short("a")
                  .long("address")
                  .value_name("ADDRESS")
-                 .help("Sets address for server. If not provided, waiter will try to figure out by itself what the local address sould be.")
+                 .help("Sets address for server. If not provided, waiter will try to determine what the local address should be.")
                  .takes_value(true))
         .arg(Arg::with_name("port")
                  .short("p")
-                 .long("--port")
+                 .long("port")
                  .value_name("PORT")
                  .help("Sets TCP port for server.")
                  .default_value(port_str)
                  .takes_value(true))
         .arg(Arg::with_name("count")
                  .short("c")
-                 .long("--count")
+                 .long("count")
                  .value_name("COUNT")
                  .help("Server will exit after <COUNT> succesful requests.")
                  .takes_value(true))
-        .arg(Arg::with_name("file")
-                 .help("File to be served")
+        .arg(Arg::with_name("directory")
+                 .short("d")
+                 .long("dir")
+                 .help("Use web directory navigation."))
+        .arg(Arg::with_name("path")
+                 .help("Path to file or directory to be served.")
                  .required(true)
                  .index(1))
         .get_matches();
-
-    let path_str = matches.value_of("file").unwrap(); // unwrapping because "file" is a required parameter
-    let path = Path::new(path_str);
-    let mut file = File::open(path).unwrap_or_else(|e| graciously_exit(&e));
-
-    let file_name = path.file_name()
-        .unwrap_or_else(|| graciously_exit("Invalid file name."))
-        .to_str()
-        .unwrap_or_else(|| graciously_exit("Invalid file name."))
-        .to_owned();
-
-    let mut file_data = Vec::new();
-    file.read_to_end(&mut file_data)
-        .unwrap_or_else(|e| graciously_exit(&e));
 
     let port = match matches.value_of("port") {
         None => DEFAULT_PORT,
@@ -146,71 +89,57 @@ fn main() {
     let server = match matches.value_of("address") {
         Some(val) => Server::http((val, port)),
         None => {
-            let ip =
-                local_ip::local_ip().expect("Unable to automatically determine local IP address.");
+            let ip = local_ip::local_ip().unwrap_or_else(|_| {
+                graciously_exit("Unable to automatically determine local address.");
+            });
             Server::http((ip, port))
         }
     };
 
     let mut server = server.unwrap_or_else(|e| graciously_exit(&e));
+
     let local_addr = server
         .local_addr()
         .unwrap_or_else(|e| graciously_exit(&e));
+    let local_addr = Arc::new(local_addr);
 
-    let file_server = FileServer {
-        count: Mutex::new(count),
-        file_data: Arc::new(file_data),
-        file_name: file_name,
-    };
+    let path_str = matches.value_of("path").unwrap();
+    // unwrapping because "path" is a required parameter, clap will report error if not present
+    let path = Path::new(path_str);
 
-    match server.handle(file_server) {
-        Ok(_) => {
-            println!("🍔  Now serving {} on http://{}", path_str, local_addr);
-        }
-        Err(e) => graciously_exit(&e),
-    };
+    // File or folder?
+    if path.is_dir() {
+        // Serving folder
+        if matches.is_present("directory") {
+            let folder_nav_server = FolderNav::new_dir_nav(count, path.to_owned());
 
-    /*
-    let server = Server::new((addr.as_ref(), port), move |req| {
-        let url = req.url();
-
-        if url == "/" {
-            if let Count::Limited(ref mut count) = *count_mutex.lock().unwrap() {
-                if *count > 0 {
-                    println!("👍  Serving {}...", path.to_string_lossy());
-                    *count -= 1;
-
-                    let file = File::open(&path).expect("Failed to open the given path");
-
-                    Response::from_file("application/octet-stream", file)
-                        .with_unique_header("content-disposition",
-                                            format!("attachment; filename={}",
-                                                    path.file_name().unwrap().to_string_lossy()))
-                } else {
-                    Response::text("Sorry boss, you are late to the party.\r\n")
+            match server.handle(folder_nav_server) {
+                Ok(_) => {
+                    println!("🍔  Now serving {} on http://{}", path_str, local_addr);
                 }
-            } else {
-                let file = File::open(&path).expect("Failed to open the given path");
-
-                Response::from_file("application/octet-stream", file)
-                    .with_unique_header("content-disposition",
-                                        format!("attachment; filename={}",
-                                                path.file_name().unwrap().to_string_lossy()))
-            }
+                Err(e) => graciously_exit(&e),
+            };
 
         } else {
-
-
-            Response::empty_404()
+            graciously_exit("Use --dir to enable web directory navigation.");
         }
 
-    })
-            .unwrap();
+    } else if path.is_file() {
+        // Serving file
+        let (file_data, file_name) = file_open(path);
 
+        let file_server = SingleFile::new_single_file(count, Arc::new(file_data), file_name);
 
-    server.run();*/
+        match server.handle(file_server) {
+            Ok(_) => {
+                println!("🍔  Now serving {} on http://{}", path_str, local_addr);
+            }
+            Err(e) => graciously_exit(&e),
+        };
 
-    println!("{:?}", local_ip::local_ip());
+    } else {
+        graciously_exit("Provided path was neither a file nor folder.");
+    }
 }
 
 use std::str::FromStr;
@@ -230,7 +159,11 @@ fn num_arg_validator<N: FromStr<Err = ParseIntError>>(num_str: &str) -> N {
 
 use std::fmt::Display;
 
-fn graciously_exit<T: Display>(msg: T) -> ! {
+pub fn graciously_exit<T: Display>(msg: T) -> ! {
     println!("{}", msg);
     process::exit(0)
+}
+
+pub fn safely_unwrap_os_str(s: &OsStr) -> &str {
+    s.to_str().unwrap_or("NON_UTF8_NAME")
 }
